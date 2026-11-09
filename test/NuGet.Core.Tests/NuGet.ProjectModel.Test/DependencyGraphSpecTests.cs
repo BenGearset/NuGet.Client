@@ -766,6 +766,80 @@ namespace NuGet.ProjectModel.Test
             Assert.NotEqual(firstHash, secondHash);
         }
 
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void GetHash_WithClosuresOfReadOnlyGraph_MatchesWritableGraphHash(bool useLegacyHashFunction)
+        {
+            // Arrange
+            string directory = Path.Combine(Path.GetTempPath(), "Projects");
+            PackageSpec[] projects = [CreatePackageSpecWithPaths(directory, "A"), CreatePackageSpecWithPaths(directory, "B"), CreatePackageSpecWithPaths(directory, "C")];
+            string projectName = projects[0].RestoreMetadata.ProjectUniqueName;
+            DependencyGraphSpec readOnly = new DependencyGraphSpec(isReadOnly: true);
+            DependencyGraphSpec writable = new DependencyGraphSpec();
+            foreach (PackageSpec project in projects)
+            {
+                readOnly.AddProject(project);
+                writable.AddProject(project);
+            }
+            string expectedHash = GetHash(writable.CreateFromClosure(projectName, projects), useLegacyHashFunction);
+
+            // Act
+            string firstHash = GetHash(readOnly.CreateFromClosure(projectName, projects), useLegacyHashFunction);
+            string secondHash = GetHash(readOnly.CreateFromClosure(projectName, projects), useLegacyHashFunction);
+            string projectClosureHash = GetHash(readOnly.WithProjectClosure(projectName), useLegacyHashFunction);
+
+            // Assert
+            Assert.Equal(expectedHash, firstHash);
+            Assert.Equal(expectedHash, secondHash);
+            Assert.Equal(GetHash(writable.WithProjectClosure(projectName), useLegacyHashFunction), projectClosureHash);
+        }
+
+        [Fact]
+        public void GetHash_WithClosuresOfReadOnlyGraphHashedConcurrently_MatchesWritableGraphHashes()
+        {
+            // Arrange
+            string directory = Path.Combine(Path.GetTempPath(), "Projects");
+            PackageSpec[] projects = Enumerable.Range(0, 20).Select(i => CreatePackageSpecWithPaths(directory, "Project" + i)).ToArray();
+            DependencyGraphSpec readOnly = new DependencyGraphSpec(isReadOnly: true);
+            DependencyGraphSpec writable = new DependencyGraphSpec();
+            foreach (PackageSpec project in projects)
+            {
+                readOnly.AddProject(project);
+                writable.AddProject(project);
+            }
+            string[] expectedHashes = projects
+                .Select((project, i) => GetHash(writable.CreateFromClosure(project.RestoreMetadata.ProjectUniqueName, projects.Take(i + 1).ToList()), useLegacyHashFunction: false))
+                .ToArray();
+
+            // Act
+            string[] actualHashes = new string[projects.Length];
+            System.Threading.Tasks.Parallel.For(0, projects.Length, i =>
+            {
+                actualHashes[i] = GetHash(readOnly.CreateFromClosure(projects[i].RestoreMetadata.ProjectUniqueName, projects.Take(i + 1).ToList()), useLegacyHashFunction: false);
+            });
+
+            // Assert
+            Assert.Equal(expectedHashes, actualHashes);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void GetHash_WhenWritableSpecChangesAfterHashing_ReturnsDifferentHash(bool useLegacyHashFunction)
+        {
+            // Arrange
+            DependencyGraphSpec dgSpec = CreateDependencyGraphSpec();
+            string firstHash = GetHash(dgSpec, useLegacyHashFunction);
+
+            // Act
+            dgSpec.GetProjectSpec("a").RestoreMetadata.RestoreEnableAnalyzerAssets = true;
+            string secondHash = GetHash(dgSpec, useLegacyHashFunction);
+
+            // Assert
+            Assert.NotEqual(firstHash, secondHash);
+        }
+
         [Fact]
         public void AddProject_WhenRestoreMetadataIsNull_AddsProject()
         {

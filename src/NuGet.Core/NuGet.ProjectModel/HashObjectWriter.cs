@@ -146,6 +146,20 @@ namespace NuGet.ProjectModel
             _writer.WriteValue(value);
         }
 
+        internal void WriteNameRawValue(string name, string json)
+        {
+            if (name == null)
+            {
+                throw new ArgumentNullException(nameof(name));
+            }
+
+            ThrowIfDisposed();
+            ThrowIfReadOnly();
+
+            _writer.WritePropertyName(name);
+            _writer.WriteRawValue(json);
+        }
+
         public void WriteNameArray(string name, IEnumerable<string> values)
         {
             if (name == null)

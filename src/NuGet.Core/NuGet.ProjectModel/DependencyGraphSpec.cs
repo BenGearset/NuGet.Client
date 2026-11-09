@@ -4,10 +4,12 @@
 #nullable disable
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Newtonsoft.Json;
@@ -41,6 +43,8 @@ namespace NuGet.ProjectModel
 
         private readonly bool _isReadOnly;
 
+        private readonly ConcurrentDictionary<PackageSpec, Lazy<string>> _packageSpecJson;
+
         private static readonly byte[] RestorePropertyName = Encoding.UTF8.GetBytes("restore");
         private static readonly byte[] ProjectsPropertyName = Encoding.UTF8.GetBytes("projects");
 
@@ -60,8 +64,14 @@ namespace NuGet.ProjectModel
         }
 
         internal DependencyGraphSpec(bool isReadOnly, IEnvironmentVariableReader environmentVariableReader)
+            : this(isReadOnly, environmentVariableReader, isReadOnly ? new ConcurrentDictionary<PackageSpec, Lazy<string>>(PackageSpecReferenceComparer.Instance) : null)
+        {
+        }
+
+        private DependencyGraphSpec(bool isReadOnly, IEnvironmentVariableReader environmentVariableReader, ConcurrentDictionary<PackageSpec, Lazy<string>> packageSpecJson)
         {
             _isReadOnly = isReadOnly;
+            _packageSpecJson = packageSpecJson;
             UseLegacyHashFunction ??= string.Equals(environmentVariableReader.GetEnvironmentVariable("NUGET_ENABLE_LEGACY_DGSPEC_HASH_FUNCTION"), bool.TrueString, StringComparison.OrdinalIgnoreCase);
         }
 
@@ -121,7 +131,7 @@ namespace NuGet.ProjectModel
         /// <returns></returns>
         public DependencyGraphSpec WithProjectClosure(string projectUniqueName)
         {
-            var projectDependencyGraphSpec = new DependencyGraphSpec();
+            var projectDependencyGraphSpec = new DependencyGraphSpec(isReadOnly: false, EnvironmentVariableWrapper.Instance, _isReadOnly ? _packageSpecJson : null);
             projectDependencyGraphSpec.AddRestore(projectUniqueName);
             foreach (var spec in GetClosure(projectUniqueName))
             {
@@ -153,7 +163,7 @@ namespace NuGet.ProjectModel
                 throw new ArgumentNullException(nameof(closure));
             }
 
-            var dgSpec = new DependencyGraphSpec();
+            var dgSpec = new DependencyGraphSpec(isReadOnly: false, EnvironmentVariableWrapper.Instance, _isReadOnly ? _packageSpecJson : null);
 
             dgSpec.AddRestore(projectUniqueName);
 
@@ -370,11 +380,46 @@ namespace NuGet.ProjectModel
 
             using IHashFunction hashFunc = getHashFunction();
             using var writer = new HashObjectWriter(hashFunc);
-            Write(writer, hashing: true, PackageSpecWriter.Write);
+            if (_packageSpecJson == null)
+            {
+                Write(writer, hashing: true, PackageSpecWriter.Write);
+            }
+            else
+            {
+                Write(writer, hashing: true, (name, project) => writer.WriteNameRawValue(name, GetPackageSpecJson(project)));
+            }
             return writer.GetHash();
         }
 
+        private string GetPackageSpecJson(PackageSpec project)
+        {
+            return _packageSpecJson.GetOrAdd(project, static p => new Lazy<string>(() => SerializeForHashing(p))).Value;
+        }
+
+        private static string SerializeForHashing(PackageSpec project)
+        {
+            using var stringWriter = new StringWriter(CultureInfo.InvariantCulture);
+            using (var jsonWriter = new JsonTextWriter(stringWriter))
+            using (var writer = new RuntimeModel.JsonObjectWriter(jsonWriter))
+            {
+                writer.WriteObjectStart();
+                PackageSpecWriter.Write(project, writer, hashing: true, EnvironmentVariableWrapper.Instance);
+                writer.WriteObjectEnd();
+            }
+            return stringWriter.ToString();
+        }
+
         private void Write(RuntimeModel.IObjectWriter writer, bool hashing, Action<PackageSpec, RuntimeModel.IObjectWriter, bool, IEnvironmentVariableReader> writeAction)
+        {
+            Write(writer, hashing, (name, project) =>
+            {
+                writer.WriteObjectStart(name);
+                writeAction.Invoke(project, writer, hashing, EnvironmentVariableWrapper.Instance);
+                writer.WriteObjectEnd();
+            });
+        }
+
+        private void Write(RuntimeModel.IObjectWriter writer, bool hashing, Action<string, PackageSpec> writeProject)
         {
             writer.WriteObjectStart();
             writer.WriteNameValue("format", Version);
@@ -397,13 +442,20 @@ namespace NuGet.ProjectModel
             {
                 var project = pair.Value;
 
-                writer.WriteObjectStart(PackageSpecWriter.NormalizePathForHashing(project.RestoreMetadata.ProjectUniqueName, hashing));
-                writeAction.Invoke(project, writer, hashing, EnvironmentVariableWrapper.Instance);
-                writer.WriteObjectEnd();
+                writeProject(PackageSpecWriter.NormalizePathForHashing(project.RestoreMetadata.ProjectUniqueName, hashing), project);
             }
 
             writer.WriteObjectEnd();
             writer.WriteObjectEnd();
+        }
+
+        private sealed class PackageSpecReferenceComparer : IEqualityComparer<PackageSpec>
+        {
+            public static readonly PackageSpecReferenceComparer Instance = new();
+
+            public bool Equals(PackageSpec x, PackageSpec y) => ReferenceEquals(x, y);
+
+            public int GetHashCode(PackageSpec obj) => RuntimeHelpers.GetHashCode(obj);
         }
 
         /// <summary>
